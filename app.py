@@ -231,11 +231,17 @@ if using_db:
             else:
                 st.caption("Bez záznamu autorů.")
 
-            # Komunity
+            # Komunity (bezpečně přes JSON extrakci)
             df_comm = con.execute(f"""
                 SELECT
-                  COALESCE(c.identifier, c.id) AS identifier,
-                  COALESCE(c.title, c.name)    AS title
+                  COALESCE(
+                    json_extract_string(CAST(c AS JSON), '$.identifier'),
+                    json_extract_string(CAST(c AS JSON), '$.id')
+                  ) AS identifier,
+                  COALESCE(
+                    json_extract_string(CAST(c AS JSON), '$.title'),
+                    json_extract_string(CAST(c AS JSON), '$.name')
+                  ) AS title
                 FROM {table_name} rr, UNNEST(rr.communities) AS t(c)
                 WHERE rr.record_id = ?
             """, [r["record_id"]]).fetchdf()
@@ -243,14 +249,20 @@ if using_db:
                 st.markdown("**Komunity**")
                 st.dataframe(df_comm, hide_index=True, use_container_width=True)
 
-            # Granty
+            # Granty (bezpečně přes JSON extrakci)
             df_gr = con.execute(f"""
                 SELECT
-                  CAST(g AS VARCHAR)                         AS grant_struct,
-                  g.id                                       AS id,
-                  COALESCE(g.acronym, g.code)                AS acronym,
-                  COALESCE(g.title, g.project_title)         AS title,
-                  CASE WHEN g.funder IS NULL THEN NULL ELSE (g.funder).name END AS funder
+                  json_extract_string(CAST(g AS JSON), '$.id') AS id,
+                  COALESCE(
+                    json_extract_string(CAST(g AS JSON), '$.acronym'),
+                    json_extract_string(CAST(g AS JSON), '$.code')
+                  ) AS acronym,
+                  COALESCE(
+                    json_extract_string(CAST(g AS JSON), '$.title'),
+                    json_extract_string(CAST(g AS JSON), '$.project_title')
+                  ) AS title,
+                  json_extract_string(CAST(g AS JSON), '$.funder.name') AS funder,
+                  CAST(g AS VARCHAR) AS grant_struct
                 FROM {table_name} rr, UNNEST(rr.grants) AS t(g)
                 WHERE rr.record_id = ?
             """, [r["record_id"]]).fetchdf()
@@ -380,11 +392,17 @@ else:
                 st.markdown("**Autoři & afiliace**")
                 st.dataframe(df_auth, hide_index=True, use_container_width=True)
 
-            # Komunity
+            # Komunity (bezpečně přes JSON extrakci)
             df_comm = con.execute("""
                 SELECT
-                  COALESCE(c.identifier, c.id) AS identifier,
-                  COALESCE(c.title, c.name)    AS title
+                  COALESCE(
+                    json_extract_string(CAST(c AS JSON), '$.identifier'),
+                    json_extract_string(CAST(c AS JSON), '$.id')
+                  ) AS identifier,
+                  COALESCE(
+                    json_extract_string(CAST(c AS JSON), '$.title'),
+                    json_extract_string(CAST(c AS JSON), '$.name')
+                  ) AS title
                 FROM raw r, UNNEST((r.metadata).communities) AS c
                 WHERE r.id = ?
             """, [r["record_id"]]).fetchdf()
@@ -392,14 +410,20 @@ else:
                 st.markdown("**Komunity**")
                 st.dataframe(df_comm, hide_index=True, use_container_width=True)
 
-            # Granty
+            # Granty (bezpečně přes JSON extrakci)
             df_gr = con.execute("""
                 SELECT
-                  CAST(g AS VARCHAR)                         AS grant_struct,
-                  g.id                                       AS id,
-                  COALESCE(g.acronym, g.code)                AS acronym,
-                  COALESCE(g.title, g.project_title)         AS title,
-                  CASE WHEN g.funder IS NULL THEN NULL ELSE (g.funder).name END AS funder
+                  json_extract_string(CAST(g AS JSON), '$.id') AS id,
+                  COALESCE(
+                    json_extract_string(CAST(g AS JSON), '$.acronym'),
+                    json_extract_string(CAST(g AS JSON), '$.code')
+                  ) AS acronym,
+                  COALESCE(
+                    json_extract_string(CAST(g AS JSON), '$.title'),
+                    json_extract_string(CAST(g AS JSON), '$.project_title')
+                  ) AS title,
+                  json_extract_string(CAST(g AS JSON), '$.funder.name') AS funder,
+                  CAST(g AS VARCHAR) AS grant_struct
                 FROM raw r, UNNEST((r.metadata).grants) AS g
                 WHERE r.id = ?
             """, [r["record_id"]]).fetchdf()
