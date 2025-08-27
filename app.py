@@ -2,14 +2,13 @@ import os
 from datetime import date, datetime
 import duckdb
 import streamlit as st
-import pandas as pd  # na dataframe a isna/notna
+import pandas as pd  # pro dataframe a isna/notna
 
 st.set_page_config(page_title="Zenodo Datasets Browser", layout="wide")
 
 # ------------------------- Helpers -------------------------
 
 def to_pydate(x):
-    """Bezpečně převede libovolný vstup (duckdb date, datetime, str, None) na datetime.date (nebo None)."""
     if x is None:
         return None
     if isinstance(x, date) and not isinstance(x, datetime):
@@ -33,14 +32,9 @@ MAX_SAFE = date(2100, 12, 31)
 def clamp_d(d: date | None, lo=MIN_SAFE, hi=MAX_SAFE):
     if d is None:
         return None
-    if d < lo:
-        return lo
-    if d > hi:
-        return hi
-    return d
+    return max(lo, min(hi, d))
 
 def nonempty_str(x):
-    """Vrátí ořezaný str, nebo None při None/pd.NA/NaN/prázdném stringu."""
     if x is None:
         return None
     try:
@@ -50,6 +44,15 @@ def nonempty_str(x):
         pass
     s = str(x).strip()
     return s if s else None
+
+def link_column_config():
+    cfg = {}
+    try:
+        from streamlit import column_config as cc
+        cfg["links_html"] = cc.LinkColumn("Zenodo", help="HTML stránka záznamu")
+    except Exception:
+        pass
+    return cfg
 
 # ------------------------- Sidebar: zdroj dat -------------------------
 
@@ -61,10 +64,10 @@ default_jsonl = "zenodo_dump/raw/records.jsonl"
 
 if mode == "DuckDB DB":
     db_path = st.sidebar.text_input("Cesta k .duckdb", value=default_db)
-    st.sidebar.caption("Očekávám tabulky: records, creators (vytvoří je harvest/postprocessing).")
+    st.sidebar.caption("Očekávám tabulky: records, creators (a volitelně view records_cz).")
 else:
     jsonl_path = st.sidebar.text_input("Cesta k .jsonl", value=default_jsonl)
-    st.sidebar.caption("Čte JSONL přes DuckDB JSON extension (pomalejší).")
+    st.sidebar.caption("Čte přímo JSONL přes DuckDB JSON extension (pomalejší).")
 
 @st.cache_resource(show_spinner=True)
 def connect_duckdb(db_path: str):
@@ -121,19 +124,27 @@ date_to = None
 # ------------------------- DuckDB (flattenované tabulky) -------------------------
 
 if using_db:
+    # volba tabulky (vše vs. CZ výběr)
+    tables = set(con.execute("SHOW TABLES").fetchnumpy()["name"])
+    scope_opts = ["All records (records)"]
+    if "records_cz" in tables:
+        scope_opts.append("CZ subset (records_cz)")
+    scope = st.sidebar.selectbox("Dataset scope", scope_opts, index=0)
+    table_name = "records" if scope.startswith("All") else "records_cz"
+
     # jazyky
     try:
-        langs_all = [r[0] for r in con.execute("SELECT DISTINCT language FROM records WHERE language IS NOT NULL ORDER BY 1").fetchall()]
+        langs_all = [r[0] for r in con.execute(f"SELECT DISTINCT language FROM {table_name} WHERE language IS NOT NULL ORDER BY 1").fetchall()]
     except Exception:
         langs_all = []
     langs = st.sidebar.multiselect("Jazyky", langs_all)
 
     # rozmezí dat
     try:
-        dmin, dmax = con.execute("""
+        dmin, dmax = con.execute(f"""
             SELECT MIN(try_cast(publication_date AS DATE)),
                    MAX(try_cast(publication_date AS DATE))
-            FROM records
+            FROM {table_name}
         """).fetchone()
     except Exception:
         dmin = dmax = None
@@ -146,7 +157,9 @@ if using_db:
     date_from = df_sel if isinstance(df_sel, date) else to_pydate(df_sel)
     date_to   = dt_sel if isinstance(dt_sel, date) else to_pydate(dt_sel)
 
-    cz_only = st.sidebar.checkbox("Pouze záznamy se stopou ČR", value=False)
+    # (volitelně) zapnutí textové CZ stopy v „All records“ režimu
+    if table_name == "records":
+        cz_only = st.sidebar.checkbox("Pouze záznamy se stopou ČR (text/afiliace/match)", value=False)
 
     # WHERE
     where = ["1=1"]
@@ -164,33 +177,33 @@ if using_db:
         where.append("try_cast(publication_date AS DATE) BETWEEN ? AND ?")
         params.extend([str(date_from), str(date_to)])
 
-    if cz_only:
+    if cz_only and table_name == "records":
         where.append("(has_cz_text_hit OR has_cz_affil_any_author OR COALESCE(has_affil_match, FALSE))")
 
     if aff_q:
-        where.append("""EXISTS (
+        where.append(f"""EXISTS (
             SELECT 1 FROM creators c
-            WHERE c.record_id = records.record_id
+            WHERE c.record_id = {table_name}.record_id
               AND lower(coalesce(c.affiliation,'')) LIKE ?
         )""")
         params.append(f"%{aff_q.lower()}%")
 
     where_sql = " AND ".join(where)
-
-    total = con.execute(f"SELECT COUNT(*) FROM records WHERE {where_sql}", params).fetchone()[0]
+    total = con.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {where_sql}", params).fetchone()[0]
     st.caption(f"Počet záznamů (po filtrech): {total:,}")
 
     offset = (page-1)*page_size
     rows = con.execute(f"""
         SELECT record_id, title, publication_date, language, doi, links_html
-        FROM records
+        FROM {table_name}
         WHERE {where_sql}
         ORDER BY try_cast(publication_date AS DATE) DESC NULLS LAST
         LIMIT ? OFFSET ?
     """, params + [page_size, offset]).fetchdf()
 
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, use_container_width=True, hide_index=True, column_config=link_column_config())
 
+    # Detaily záznamů
     st.subheader("Detaily vybraných záznamů")
     max_details = st.slider("Kolik detailů vykreslit (z aktuální stránky)", 1, min(len(rows), 10), min(len(rows), 5))
     for _, r in rows.head(max_details).iterrows():
@@ -205,6 +218,7 @@ if using_db:
             st.write("**Publication date:**", nonempty_str(r["publication_date"]) or "—")
             st.write("**Language:**", nonempty_str(r["language"]) or "—")
 
+            # Autoři
             df_auth = con.execute("""
                 SELECT author_name, affiliation, orcid
                 FROM creators
@@ -216,6 +230,34 @@ if using_db:
                 st.dataframe(df_auth, hide_index=True, use_container_width=True)
             else:
                 st.caption("Bez záznamu autorů.")
+
+            # Komunity
+            df_comm = con.execute(f"""
+                SELECT
+                  COALESCE(c.identifier, c.id) AS identifier,
+                  COALESCE(c.title, c.name)    AS title
+                FROM {table_name} rr, UNNEST(rr.communities) AS t(c)
+                WHERE rr.record_id = ?
+            """, [r["record_id"]]).fetchdf()
+            if not df_comm.empty:
+                st.markdown("**Komunity**")
+                st.dataframe(df_comm, hide_index=True, use_container_width=True)
+
+            # Granty
+            df_gr = con.execute(f"""
+                SELECT
+                  CAST(g AS VARCHAR)                         AS grant_struct,
+                  g.id                                       AS id,
+                  COALESCE(g.acronym, g.code)                AS acronym,
+                  COALESCE(g.title, g.project_title)         AS title,
+                  CASE WHEN g.funder IS NULL THEN NULL ELSE (g.funder).name END AS funder
+                FROM {table_name} rr, UNNEST(rr.grants) AS t(g)
+                WHERE rr.record_id = ?
+            """, [r["record_id"]]).fetchdf()
+            if not df_gr.empty:
+                st.markdown("**Granty**")
+                show_cols = [c for c in ["id","acronym","title","funder","grant_struct"] if c in df_gr.columns]
+                st.dataframe(df_gr[show_cols], hide_index=True, use_container_width=True)
 
 # ------------------------- JSONL (raw) přes DuckDB JSON -------------------------
 
@@ -252,8 +294,7 @@ else:
                MAX(
                  COALESCE(try_strptime(publication_date,'%Y-%m-%d')::DATE,
                           DATE(try_cast(created AS TIMESTAMP)),
-                          DATE(try_cast(updated AS TIMESTAMP)))
-               )
+                          DATE(try_cast(updated AS TIMESTAMP))))
         FROM rec
     """).fetchone()
 
@@ -295,7 +336,6 @@ else:
         params.append(f"%{aff_q.lower()}%")
 
     where_sql = " AND ".join(where)
-
     total = con.execute(f"SELECT COUNT(*) FROM rec WHERE {where_sql}", params).fetchone()[0]
     st.caption(f"Počet záznamů (po filtrech): {total:,}")
 
@@ -310,7 +350,7 @@ else:
         LIMIT ? OFFSET ?
     """, params + [page_size, offset]).fetchdf()
 
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, use_container_width=True, hide_index=True, column_config=link_column_config())
 
     st.subheader("Detaily vybraných záznamů")
     max_details = st.slider("Kolik detailů vykreslit (z aktuální stránky)", 1, min(len(rows), 10), min(len(rows), 5))
@@ -340,3 +380,30 @@ else:
                 st.markdown("**Autoři & afiliace**")
                 st.dataframe(df_auth, hide_index=True, use_container_width=True)
 
+            # Komunity
+            df_comm = con.execute("""
+                SELECT
+                  COALESCE(c.identifier, c.id) AS identifier,
+                  COALESCE(c.title, c.name)    AS title
+                FROM raw r, UNNEST((r.metadata).communities) AS c
+                WHERE r.id = ?
+            """, [r["record_id"]]).fetchdf()
+            if not df_comm.empty:
+                st.markdown("**Komunity**")
+                st.dataframe(df_comm, hide_index=True, use_container_width=True)
+
+            # Granty
+            df_gr = con.execute("""
+                SELECT
+                  CAST(g AS VARCHAR)                         AS grant_struct,
+                  g.id                                       AS id,
+                  COALESCE(g.acronym, g.code)                AS acronym,
+                  COALESCE(g.title, g.project_title)         AS title,
+                  CASE WHEN g.funder IS NULL THEN NULL ELSE (g.funder).name END AS funder
+                FROM raw r, UNNEST((r.metadata).grants) AS g
+                WHERE r.id = ?
+            """, [r["record_id"]]).fetchdf()
+            if not df_gr.empty:
+                st.markdown("**Granty**")
+                show_cols = [c for c in ["id","acronym","title","funder","grant_struct"] if c in df_gr.columns]
+                st.dataframe(df_gr[show_cols], hide_index=True, use_container_width=True)
