@@ -31,10 +31,6 @@ class ZenodoElasticsearchHarvester:
         self.checkpoint_file = self.output_dir / "checkpoints.json"
         self.duplicate_log = self.output_dir / "duplicates.log"
         
-        # Cache pro filtrování duplicit
-        self.seen_record_ids: Set[str] = set()
-        self.load_existing_record_ids()
-        
         # Rate limiting - Zenodo: 1000 req/hour pro anonymní
         self.max_requests_per_hour = 900  # Rezerva
         self.request_times = []
@@ -45,6 +41,10 @@ class ZenodoElasticsearchHarvester:
         self.tiebreaker_field = "id"  # ID jako tiebreaker
         
         self.setup_logging()
+        
+        # Cache pro filtrování duplicit - after logging setup
+        self.seen_record_ids: Set[str] = set()
+        self.load_existing_record_ids()
     
     def load_existing_record_ids(self):
         """Načte existující record ID pro filtrování duplicit"""
@@ -575,8 +575,8 @@ class ZenodoElasticsearchHarvester:
         progress = self.load_progress()
         
         # Vygeneruj bezpečné queries
-        all_queries = self.generate_safe_queries()  # Original - all years
-        # all_queries = self.generate_safe_queries(start_year=2017, end_year=2017)  # TEST: Only 2017
+        # all_queries = self.generate_safe_queries()  # Original - all years
+        all_queries = self.generate_safe_queries(start_year=2017, end_year=2017)  # TEST: Only 2017
         
         self.logger.info("=== Zenodo Harvest with Elasticsearch Best Practices ===")
         self.logger.info(f"Generated {len(all_queries)} safe queries (type=dataset as separate parameter)")
