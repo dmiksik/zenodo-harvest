@@ -3,58 +3,45 @@
 """
 harvest_day.py — Harvest a single heavy day from Zenodo (datasets, all_versions=false)
 by recursively splitting the day into smaller time windows until each window
-has <= --hard-cap results. Uses created timestamps, UTC, with right-exclusive windows.
+has <= --hard-cap results. Uses created timestamps (UTC), inclusive ranges
+with the upper bound shifted back by 1 millisecond to avoid overlaps.
 
-Použití:
+Usage:
     python harvest_day.py --day 2023-12-28 --out-dir ./zenodo_days \
-      --main-jsonl zenodo_dump/raw/records.jsonl
-
-Parametry:
-  --day YYYY-MM-DD            Den v UTC (povinné)
-  --out-dir PATH              Kam uložit výsledky (povinné)
-  --main-jsonl PATH           Hlavní records.jsonl pro deduplikaci (volitelné)
-  --size INT                  Velikost stránky (<=1000, default 100)
-  --throttle-per-minute INT   Požadavků/min (default 55)
-  --hard-cap INT              Limit záznamů na okno před dělením (default 9000)
-
-Výstupy:
-  <DAY>_raw.jsonl    – všechny stažené záznamy z daného dne (může obsahovat duplicitní id napříč okny)
-  <DAY>_dedup.jsonl  – odduplikovaná verze (podle id) a zároveň odfiltrovaná proti --main-jsonl (pokud je zadán)
+      --main-jsonl zenodo_dump/raw/records.jsonl \
+      --size 500 --throttle-per-minute 50 --hard-cap 9000
 """
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
 from datetime import datetime, timezone, timedelta
-
 import requests
+import math
+from requests.exceptions import RequestException
 
 Z_API = "https://zenodo.org/api/records"
 
 
 def iso_z(dt: datetime) -> str:
-    """ISO8601 UTC s koncovým 'Z'."""
+    """Return ISO8601 timestamp in UTC ending with 'Z'."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def build_range(field: str, start_iso: str, end_iso: str,
-                inclusive_left: bool = True, inclusive_right: bool = False) -> str:
+def build_inclusive_range(field: str, start_iso: str, end_iso: str) -> str:
     """
-    Sestaví Lucene range výraz s uvozovkami okolo časů.
-    Default tvar: [start TO end}  (levá inkl., pravá EXKLUZIVNÍ)
+    Inclusive Lucene range with quoted timestamps:
+        field:["start" TO "end"]
     """
-    left = "[" if inclusive_left else "{"
-    right = "]" if inclusive_right else "}"
-    return f'{field}:{left}"{start_iso}" TO "{end_iso}"{right}'
+    return f'{field}:["{start_iso}" TO "{end_iso}"]'
 
 
 def extract_total(data: dict) -> int:
-    """Bezpečně vytáhne total z odpovědi Zenodo API (int nebo objekt s .value)."""
+    """Safely extract total from Zenodo response (int or {'value': int})."""
     hits = data.get("hits", {})
     total = hits.get("total", 0)
     if isinstance(total, dict):
@@ -66,101 +53,150 @@ def extract_total(data: dict) -> int:
 
 
 def get_total(session: requests.Session, q: str, all_versions: bool = False) -> int:
-    """Vrátí pouze počet záznamů pro daný dotaz (size=0)."""
+    """Return only the count for given query. Uses size=1 (size=0 is invalid here)."""
     params = {
         "q": q,
         "all_versions": "true" if all_versions else "false",
-        "size": 0,
+        "size": 1,
     }
     r = session.get(Z_API, params=params, timeout=60)
     r.raise_for_status()
     return extract_total(r.json())
 
 
+def request_with_retries(session, url, params, timeout, max_retries=6, throttle_s=0.0):
+    """
+    GET s retry/backoff. Reaguje na 5xx, 429 a síťové chyby.
+    Při 429 respektuje Retry-After (pokud je).
+    """
+    attempt = 0
+    while True:
+        try:
+            r = session.get(url, params=params, timeout=timeout)
+            # 429: Too Many Requests → respektuj Retry-After
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else max(5.0, 2.0 ** attempt)
+                time.sleep(wait)
+                attempt += 1
+                if attempt > max_retries:
+                    r.raise_for_status()
+                continue
+            # 5xx: backoff
+            if 500 <= r.status_code < 600:
+                wait = max(3.0, 2.0 ** attempt)
+                time.sleep(wait)
+                attempt += 1
+                if attempt > max_retries:
+                    r.raise_for_status()
+                continue
+            # 2xx → hotovo
+            r.raise_for_status()
+            return r
+        except RequestException:
+            wait = max(3.0, 2.0 ** attempt)
+            time.sleep(wait)
+            attempt += 1
+            if attempt > max_retries:
+                raise
+
 def fetch_window(session: requests.Session, q: str, size: int, throttle_s: float, out_fh):
     """
-    Projede stránky v rámci JEDNOHO pevného okna (q už obsahuje range) a zapisuje JSONL.
+    Projede stránky pevného okna. Při 5xx/429/netechnických výpadcích
+    opakuje požadavek s backoffem. Při opakovaných chybách okno dočasně
+    zmenší `size` (nejnižší 50).
     """
     page = 1
+    current_size = size
     while True:
         params = {
             "q": q,
             "all_versions": "false",
-            "size": size,
+            "size": current_size,
             "page": page,
-            "sort": "mostrecent",  # stabilní pořadí v pevném okně
+            "sort": "mostrecent",
         }
-        r = session.get(Z_API, params=params, timeout=120)
-        r.raise_for_status()
-        data = r.json()
-        hits = data.get("hits", {}).get("hits", [])
-        if not hits:
-            break
-        for rec in hits:
-            out_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        page += 1
-        time.sleep(throttle_s)
+        try:
+            r = request_with_retries(session, Z_API, params, timeout=120, max_retries=6, throttle_s=throttle_s)
+            data = r.json()
+            hits = data.get("hits", {}).get("hits", [])
+            if not hits:
+                break
+            for rec in hits:
+                out_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            page += 1
+            time.sleep(throttle_s)
+            # když jsme uspěli, můžeme zkusit vrátit size k původní hodnotě
+            if current_size < size:
+                current_size = min(size, current_size * 2)
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status and 500 <= status < 600:
+                # po tvrdé 5xx chybě ještě jednou zkusíme s menší stránkou
+                current_size = max(50, current_size // 2)
+                continue
+            raise
 
 
 def split_until_cap(session: requests.Session,
-                    start: datetime, end: datetime,
+                    start: datetime, end_exclusive: datetime,
                     hard_cap: int, throttle_s: float):
     """
-    Rekurzivně rozdělí EXKLUZIVNÍ pravé okno [start TO end} na menší okna, dokud
-    nebude count <= hard_cap. Vracené položky jsou dvojice (start_dt, end_dt),
-    kde end je EXKLUZIVNÍ.
+    Recursively split the day [start, end) into sub-windows until each has <= hard_cap.
+    Each query uses INCLUSIVE range, but the upper bound is (end - 1 ms), so adjacent
+    windows don't overlap. Returns list of (start_dt, end_exclusive_dt).
     """
-    stack = [(start, end)]
+    stack = [(start, end_exclusive)]
     result = []
-    while stack:
-        s, e = stack.pop()
+    one_ms = timedelta(microseconds=1000)
 
-        # Odhad počtu v okně [s TO e}
-        rng_q = build_range("created", iso_z(s), iso_z(e), inclusive_left=True, inclusive_right=False)
+    while stack:
+        s, e_excl = stack.pop()
+
+        s_iso = iso_z(s)
+        e_inc_iso = iso_z(e_excl - one_ms)  # inclusive upper bound is end-1ms
+        rng_q = build_inclusive_range("created", s_iso, e_inc_iso)
         q = f"(resource_type.type:dataset) AND {rng_q}"
         total = get_total(session, q)
 
         if total <= hard_cap:
-            result.append((s, e))
+            result.append((s, e_excl))
             time.sleep(throttle_s)
             continue
 
-        # Pokud už okno prakticky nejde řezat (≤1s), přijmi ho
-        span = (e - s).total_seconds()
+        span = (e_excl - s).total_seconds()
         if span <= 1:
-            result.append((s, e))
+            # If we got here, the window is tiny but still > hard_cap; accept anyway
+            result.append((s, e_excl))
             time.sleep(throttle_s)
             continue
 
-        # Split v polovině
-        mid = s + (e - s) / 2
-        # Zajisti posun aspoň o 1 s, aby se to nezacyklilo
-        half = int(span // 2)
-        mid_floor = s + timedelta(seconds=max(1, half))
-        if mid_floor <= s:
-            mid_floor = s + timedelta(seconds=1)
-        if mid_floor >= e:
-            mid_floor = e - timedelta(seconds=1)
+        # Split in half
+        half_seconds = max(1, int(span // 2))
+        mid = s + timedelta(seconds=half_seconds)
+        if mid <= s:
+            mid = s + timedelta(seconds=1)
+        if mid >= e_excl:
+            mid = e_excl - timedelta(seconds=1)
 
-        # Dvě EXKLUZIVNÍ pravá okna: [s TO mid} a [mid TO e}
-        stack.append((mid_floor, e))   # pravé
-        stack.append((s, mid_floor))   # levé
+        # Two sub-windows: [s, mid) and [mid, e_excl)
+        stack.append((mid, e_excl))  # right
+        stack.append((s, mid))       # left
 
         time.sleep(throttle_s)
 
-    # Výstup srovnej podle startu
     result.sort(key=lambda t: t[0])
     return result
 
 
 def dedupe_day_output(day_raw_path: str, main_jsonl_path: str | None, day_dedup_path: str):
     """
-    Dedup podle record `id` v rámci dne a (pokud je zadaný) i proti hlavnímu JSONL.
-    Záznamy bez `id` přeskočíme.
+    Deduplicate by record 'id' within the day and (if provided) against the main JSONL.
+    Records without 'id' are skipped.
     """
     seen_ids = set()
 
-    # 1) Načti existující id z hlavního dumpu
+    # Against the main dump
     if main_jsonl_path and os.path.exists(main_jsonl_path):
         with open(main_jsonl_path, "r", encoding="utf-8") as base:
             for line in base:
@@ -171,7 +207,7 @@ def dedupe_day_output(day_raw_path: str, main_jsonl_path: str | None, day_dedup_
                 except Exception:
                     continue
 
-    # 2) Dedup v rámci dne
+    # Within the day
     in_count, out_count = 0, 0
     with open(day_raw_path, "r", encoding="utf-8") as inp, \
          open(day_dedup_path, "w", encoding="utf-8") as outp:
@@ -195,25 +231,25 @@ def dedupe_day_output(day_raw_path: str, main_jsonl_path: str | None, day_dedup_
 
 def main():
     ap = argparse.ArgumentParser(description="Harvest a single heavy day from Zenodo (datasets).")
-    ap.add_argument("--day", required=True, help="Den v UTC, formát YYYY-MM-DD (např. 2023-12-28)")
-    ap.add_argument("--out-dir", required=True, help="Výstupní adresář")
-    ap.add_argument("--main-jsonl", default=None, help="Cesta k hlavnímu records.jsonl pro deduplikaci (volitelné)")
-    ap.add_argument("--size", type=int, default=100, help="Velikost stránky pro Zenodo API (<= 1000)")
-    ap.add_argument("--throttle-per-minute", type=int, default=55, help="Max počet požadavků za minutu")
-    ap.add_argument("--hard-cap", type=int, default=9000, help="Max záznamů na sub-okno před dalším dělením")
+    ap.add_argument("--day", required=True, help="UTC day, format YYYY-MM-DD (e.g., 2023-12-28)")
+    ap.add_argument("--out-dir", required=True, help="Output directory")
+    ap.add_argument("--main-jsonl", default=None, help="Path to main records.jsonl for deduplication (optional)")
+    ap.add_argument("--size", type=int, default=100, help="Zenodo API page size (<= 1000)")
+    ap.add_argument("--throttle-per-minute", type=int, default=55, help="Max requests per minute")
+    ap.add_argument("--hard-cap", type=int, default=9000, help="Max records per sub-window before further split")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Den [start, end) — tedy end je další půlnoc (pravá EXKLUZIVNÍ hranice)
+    # Day interval [start, end) — end is next midnight (exclusive)
     try:
         day_dt = datetime.strptime(args.day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
-        print("ERROR: --day musí být ve formátu YYYY-MM-DD", file=sys.stderr)
+        print("ERROR: --day must be in format YYYY-MM-DD", file=sys.stderr)
         sys.exit(2)
 
     day_start = day_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end = (day_start + timedelta(days=1))  # exkluzivní horní hranice
+    day_end_excl = day_start + timedelta(days=1)  # exclusive upper bound
 
     raw_path = os.path.join(args.out_dir, f"{args.day}_raw.jsonl")
     dedup_path = os.path.join(args.out_dir, f"{args.day}_dedup.jsonl")
@@ -221,33 +257,36 @@ def main():
     throttle_s = max(0.0, 60.0 / float(args.throttle_per_minute))
 
     with requests.Session() as sess:
-        # 1) Vypočti sub-okna s pravou exkluzivní hranicí
-        print(f"[1/4] Buduji sub-okna pro {args.day} (created, UTC), hard_cap={args.hard_cap} …")
-        windows = split_until_cap(sess, day_start, day_end, args.hard_cap, throttle_s)
-        # Odhad počtu (jen informativně)
+        print(f"[1/4] Building sub-windows for {args.day} (created, UTC), hard_cap={args.hard_cap} …")
+        windows = split_until_cap(sess, day_start, day_end_excl, args.hard_cap, throttle_s)
+
+        # Informative estimate
         total_est = 0
-        for s, e in windows:
-            rng_q = build_range("created", iso_z(s), iso_z(e), True, False)
+        one_ms = timedelta(microseconds=1000)
+        for s, e_excl in windows:
+            s_iso = iso_z(s)
+            e_inc_iso = iso_z(e_excl - one_ms)
+            rng_q = build_inclusive_range("created", s_iso, e_inc_iso)
             q = f"(resource_type.type:dataset) AND {rng_q}"
             total_est += get_total(sess, q)
             time.sleep(throttle_s)
-        print(f"     Oken: {len(windows)}, odhad celkem: {total_est}")
+        print(f"     Windows: {len(windows)}, estimated total: {total_est}")
 
-        # 2) Harvest všech oken do RAW JSONL
-        print(f"[2/4] Stahuju okna do {raw_path} …")
+        print(f"[2/4] Harvesting windows into {raw_path} …")
         with open(raw_path, "w", encoding="utf-8") as out_fh:
-            for s, e in windows:
-                rng_q = build_range("created", iso_z(s), iso_z(e), True, False)  # [s TO e}
+            for s, e_excl in windows:
+                s_iso = iso_z(s)
+                e_inc_iso = iso_z(e_excl - one_ms)  # inclusive end
+                rng_q = build_inclusive_range("created", s_iso, e_inc_iso)
                 q = f"(resource_type.type:dataset) AND {rng_q}"
-                print(f"     Okno {iso_z(s)} .. {iso_z(e)}")
+                print(f"     Window {s_iso} .. {e_inc_iso}")
                 fetch_window(sess, q, args.size, throttle_s, out_fh)
 
-    # 3) Dedup proti main JSONL a v rámci dne
-    print(f"[3/4] Deduplikuju vůči main JSONL → {dedup_path} …")
+    print(f"[3/4] Deduplicating vs. main JSONL → {dedup_path} …")
     in_count, out_count = dedupe_day_output(raw_path, args.main_jsonl, dedup_path)
-    print(f"     RAW řádků: {in_count}  →  po dedup: {out_count}")
+    print(f"     RAW lines: {in_count}  →  after dedup: {out_count}")
 
-    # 4) Rychlá sanity
+    # Quick sanity: distinct ids in dedup
     try:
         distinct = set()
         kept = 0
@@ -260,11 +299,11 @@ def main():
                     kept += 1
                 except Exception:
                     continue
-        print(f"[4/4] Sanity: v dedup souboru lines={kept}, distinct_ids={len(distinct)}")
+        print(f"[4/4] Sanity: dedup file lines={kept}, distinct_ids={len(distinct)}")
     except Exception as e:
         print(f"[4/4] Sanity check failed: {e}", file=sys.stderr)
 
-    print("Hotovo.")
+    print("Done.")
     print(f"RAW:    {raw_path}")
     print(f"DEDUP.: {dedup_path}")
 

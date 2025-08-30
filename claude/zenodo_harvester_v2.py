@@ -575,8 +575,8 @@ class ZenodoElasticsearchHarvester:
         progress = self.load_progress()
         
         # Vygeneruj bezpečné queries
-        # all_queries = self.generate_safe_queries()  # Original - all years
-        all_queries = self.generate_safe_queries(start_year=2017, end_year=2017)  # TEST: Only 2017
+        all_queries = self.generate_safe_queries()  # Original - all years
+        # all_queries = self.generate_safe_queries(start_year=2017, end_year=2017)  # TEST: Only 2017
         
         self.logger.info("=== Zenodo Harvest with Elasticsearch Best Practices ===")
         self.logger.info(f"Generated {len(all_queries)} safe queries (type=dataset as separate parameter)")
