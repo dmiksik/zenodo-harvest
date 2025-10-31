@@ -1,6 +1,1 @@
-__pycache__
-/zenodo_dump/matches/
-/zenodo_dump/parquet/
-/zenodo_dump/state/
-/zenodo_dump/zenodo.duckdb
 /zenodo_dump2/
