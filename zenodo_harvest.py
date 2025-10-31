@@ -2,20 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 Zenodo datasets harvester (resumable, robust splitting)
-- Stabilní stránkování pro okna dle `created` (sort=oldest), jinak mostrecent.
-- Rozdělování oken vždy, dokud total > hard_cap (i jednodenních → půldny/hodiny).
-- Při HTTP 400 (result window too large) okno rozdělí, místo „stop early“.
-- Respektuje rate-limit (throttle), 429/5xx retry s backoffem.
-- RAW JSONL + stav fronty (state.json) → navázání kdekoliv.
-
-pip install requests python-dateutil tqdm
+- window-field=created -> sort=oldest (stable paging)
+- status=published filter applied to all API requests
+- split windows always while total > hard_cap (even single-day -> halves/hours)
+- on HTTP 400 split window (do not stop early)
+- rate-limit friendly; 429/5xx retries with backoff
+- writes RAW JSONL and state.json (resumable)
 """
 
 from __future__ import annotations
 import argparse, json, math, time, sys, os, logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone, date
-from typing import List, Dict, Any, Optional, Deque, Tuple
+from typing import List, Dict, Any, Deque, Tuple
 from collections import deque
 
 import requests
@@ -27,16 +26,13 @@ from tqdm import tqdm
 ZENODO_API = "https://zenodo.org/api/records"
 ONE_MS = timedelta(milliseconds=1)
 
-# --------------- util ----------------
+# ----------------- utils -----------------
 
 def iso_z(dt: datetime) -> str:
-    """ISO8601 UTC s 'Z'."""
+    """Return ISO8601 UTC with 'Z'."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def iso_date(d: date) -> str:
-    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc).strftime("%Y-%m-%d")
 
 def parse_date(s: str) -> date:
     return dateparser.parse(s).date()
@@ -86,22 +82,24 @@ def get_total(sess: requests.Session, params: Dict[str, Any]) -> int:
     except Exception: return 0
 
 def choose_sort_for_field(field: str) -> str:
-    # Stabilní stránkování pro okna podle created
+    # Stable paging for created; others keep mostrecent
     return "oldest" if field == "created" else "mostrecent"
 
 def inclusive_range_q(field_iso_left: str, field_iso_right_excl: str, field: str) -> str:
     """
-    V API použijeme inkluzivní hranice, ale pravou (end_excl) posuneme o -1ms:
+    Use inclusive query bounds but subtract 1ms from exclusive right bound:
       field:["start_iso" TO "end_excl - 1ms"]
     """
     start_iso = field_iso_left
     end_iso_incl = (dateparser.parse(field_iso_right_excl) - ONE_MS).strftime("%Y-%m-%dT%H:%M:%SZ")
     return f'{field}:["{start_iso}" TO "{end_iso_incl}"]'
 
+# ----------------- windows -----------------
+
 @dataclass
 class Window:
-    start_iso: str       # levá inkluzivní (ISO UTC s Z)
-    end_excl_iso: str    # pravá EXKLUZIVNÍ (ISO UTC s Z)
+    start_iso: str       # inclusive left (ISO UTC 'Z')
+    end_excl_iso: str    # exclusive right (ISO UTC 'Z')
     est_total: int = 0
     page: int = 1
     size: int = 250
@@ -112,7 +110,7 @@ class Window:
         e = dateparser.parse(self.end_excl_iso)
         return e - s
 
-    def split_mid(self) -> Tuple['Window','Window']:
+    def split_mid(self) -> tuple['Window','Window']:
         s = dateparser.parse(self.start_iso)
         e = dateparser.parse(self.end_excl_iso)
         mid = s + (e - s) / 2
@@ -120,18 +118,16 @@ class Window:
         right = Window(iso_z(mid), iso_z(e), 0, 1, self.size, False)
         return left, right
 
-# --------------- window planning ----------------
-
 def plan_windows_by_count(sess: requests.Session, field: str,
                           start_dt: datetime, end_excl_dt: datetime,
                           hard_cap: int, base_params: Dict[str, Any],
                           throttle_s: float) -> List[Window]:
     """
-    Rozdělí [start, end) na okna tak, aby v každém bylo <= hard_cap výsledků.
-    Dělí se vždy (i u jednodenních), dokud total > hard_cap.
+    Recursively split [start, end) until each window has <= hard_cap results.
+    Always split while total > hard_cap (even for 1-day windows).
     """
     out: List[Window] = []
-    stack: List[Tuple[datetime, datetime]] = [(start_dt, end_excl_dt)]
+    stack: List[tuple[datetime, datetime]] = [(start_dt, end_excl_dt)]
     sort = choose_sort_for_field(field)
 
     pbar = tqdm(total=1, desc=f"Counting windows ({field})", unit="win")
@@ -153,20 +149,18 @@ def plan_windows_by_count(sess: requests.Session, field: str,
         if total <= hard_cap:
             out.append(w)
         else:
-            # vždy dělíme – i u jednodenních; pokud < 24h, dělíme půlky/hodiny
-            s2, e2 = s, e_excl
-            left, right = Window(iso_z(s2), iso_z(s2 + (e2 - s2)/2)), Window(iso_z(s2 + (e2 - s2)/2), iso_z(e2))
-            # Bez ohledu na délku přidáme obě půlky
-            stack.extend([(dateparser.parse(right.start_iso), dateparser.parse(right.end_excl_iso)),
-                          (dateparser.parse(left.start_iso), dateparser.parse(left.end_excl_iso))])
+            # always split (even sub-day)
+            mid = s + (e_excl - s) / 2
+            left = (s, mid)
+            right = (mid, e_excl)
+            stack.extend([right, left])
         time.sleep(throttle_s)
 
     pbar.close()
-    # seřaď okna vzestupně podle startu
     out.sort(key=lambda W: W.start_iso)
     return out
 
-# --------------- harvesting ----------------
+# ----------------- harvesting -----------------
 
 @dataclass
 class HarvestState:
@@ -196,11 +190,8 @@ def harvest(out_dir: str, sess: requests.Session, field: str,
     queue: Deque[Window] = deque()
 
     if state.windows:
-        # resume
-        for w in state.windows:
-            queue.append(Window(**w))
+        for w in state.windows: queue.append(Window(**w))
     else:
-        # init fresh
         for w in windows:
             w.size = size
             queue.append(w)
@@ -215,7 +206,6 @@ def harvest(out_dir: str, sess: requests.Session, field: str,
         sort = choose_sort_for_field(field)
         q = inclusive_range_q(w.start_iso, w.end_excl_iso, field)
 
-        # dočti přesný total (kvůli max_pages), když chybí/je 0
         if w.est_total <= 0:
             w.est_total = get_total(sess, dict(base_params, sort=sort, q=q))
         max_pages = max(1, math.ceil(w.est_total / w.size) + 2)
@@ -243,14 +233,14 @@ def harvest(out_dir: str, sess: requests.Session, field: str,
 
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", "5"))
-                logging.info("429 p%d. Retry-After=%ss (rate %s/%s reset %s)", w.page, wait, rl_rem, rl_lim, rl_res)
+                logging.info("429 p%d. Retry-After=%ss (rate %s/%s reset %s)",
+                             w.page, wait, rl_rem, rl_lim, rl_res)
                 time.sleep(wait); continue
 
             if r.status_code >= 500:
                 consecutive_5xx += 1
                 logging.info("5xx p%d (try %d). Retry 3s", w.page, consecutive_5xx)
                 time.sleep(3)
-                # auto-split trigger na dlouhé 5xx/bez progresu
                 if consecutive_5xx >= 8 or (time.time() - last_progress) > 300:
                     left, right = w.split_mid()
                     logging.warning("Auto-splitting window %s..%s due to persistent 5xx",
@@ -263,16 +253,16 @@ def harvest(out_dir: str, sess: requests.Session, field: str,
                 continue
 
             if r.status_code == 400:
-                # Rozdělit okno místo „stop early“
-                left, right = w.split_mid()
-                # Pokud je okno velmi krátké, sniž page size
+                # split instead of stopping early
                 if w.duration() <= timedelta(hours=1) and w.size > 50:
                     w.size = max(50, w.size // 2)
                     logging.warning("400 p%d on short window. Reducing size→%d and retrying.",
                                     w.page, w.size)
                     state.windows = [asdict(x) for x in queue]; state.save(state_path)
                     time.sleep(time_per_req); continue
-                logging.warning("400 p%d. Splitting window %s..%s", w.page, w.start_iso, w.end_excl_iso)
+                left, right = w.split_mid()
+                logging.warning("400 p%d. Splitting window %s..%s",
+                                w.page, w.start_iso, w.end_excl_iso)
                 queue.popleft()
                 queue.appendleft(right); queue.appendleft(left)
                 state.windows = [asdict(x) for x in queue]; state.save(state_path)
@@ -288,7 +278,6 @@ def harvest(out_dir: str, sess: requests.Session, field: str,
             if n == 0:
                 break
 
-            # in-memory dedupe (volitelné)
             if seen_ids is not None:
                 out = []
                 for it in items:
@@ -305,16 +294,13 @@ def harvest(out_dir: str, sess: requests.Session, field: str,
             consecutive_5xx = 0
             last_progress = time.time()
 
-            # persist state (včetně posunuté page)
             queue[0] = w
             state.windows = [asdict(x) for x in queue]
             state.save(state_path)
-
             time.sleep(time_per_req)
 
         page_pbar.close()
 
-        # pokud jsme neskočili kvůli splitu, okno je hotovo
         if queue and queue[0] is w:
             queue.popleft()
             state.windows = [asdict(x) for x in queue]
@@ -324,21 +310,21 @@ def harvest(out_dir: str, sess: requests.Session, field: str,
     pbar.close()
     logging.info("Harvesting finished. RAW at %s", raw_path)
 
-# --------------- main ----------------
+# ----------------- main -----------------
 
 def main():
     ap = argparse.ArgumentParser(description="Zenodo datasets harvester (resumable, robust splitting)")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--size", type=int, default=250)
     ap.add_argument("--throttle-per-minute", type=int, default=55)
-    ap.add_argument("--window-field", choices=["created","updated","publication_date"], default="created")
+    ap.add_argument("--window-field", choices=["created","updated"], default="created")
     ap.add_argument("--date-from", required=True)
     ap.add_argument("--date-to", default=None)
     ap.add_argument("--hard-cap", type=int, default=9000)
     ap.add_argument("--append", action="store_true")
     ap.add_argument("--state-file", default=None)
     ap.add_argument("--dedupe-in-memory", action="store_true",
-                    help="Drží set(id) v RAM a eliminuje duplicitní zápisy.")
+                    help="Keep in-memory set(id) to avoid duplicate writes.")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
@@ -350,18 +336,19 @@ def main():
 
     sess = build_session()
 
-    # Snapshot horní hranice (exkluzivní)
+    # Snapshot exclusive upper bound
     start = parse_date(args.date_from)
     if args.date_to:
         end_excl = parse_date(args.date_to) + timedelta(days=1)
     else:
-        # dnešek + 1 den (exkluzivně) → fixuje snapshot v okamžiku startu
         end_excl = datetime.now(timezone.utc).date() + timedelta(days=1)
 
-    # počáteční okna (podle počtu s dělením vždy)
     field = args.window_field
-    sort = choose_sort_for_field(field)
-    base_params = {"type":"dataset","all_versions":0}
+    base_params = {
+        "type": "dataset",
+        "all_versions": 0,
+        "status": "published",   # <<<<<< added as requested
+    }
 
     windows = plan_windows_by_count(
         sess=sess, field=field,
