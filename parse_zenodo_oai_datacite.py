@@ -777,11 +777,16 @@ def json_default(obj: Any):
 
 def iter_input_files(input_list: Optional[Path], input_dir: Optional[Path]) -> Iterator[Path]:
     if input_list:
+        list_dir = input_list.resolve().parent
         with input_list.open("r", encoding="utf-8") as fh:
             for line in fh:
                 value = line.strip()
-                if value:
-                    yield Path(value)
+                if not value:
+                    continue
+                path = Path(value)
+                if not path.is_absolute():
+                    path = list_dir / path
+                yield path
     elif input_dir:
         for path in sorted(input_dir.rglob("*.xml")):
             yield path
