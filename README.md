@@ -16,7 +16,7 @@
 - `records.jsonl` — harvested records
 - `state.json` — resume state
 
-**See [zenodo_harvest4]([url](https://github.com/dmiksik/zenodo-harvest/tree/master/zenodo_harvest4)) for the current output.**
+**See [zenodo_harvest4](./zenodo_harvest4/) for the current output.**
 
 ## Basic usage
 
