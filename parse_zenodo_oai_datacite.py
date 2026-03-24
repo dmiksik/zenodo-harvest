@@ -469,7 +469,6 @@ def parse_record_file(path: Path, issue_tracker: IssueTracker, strict_unknown: b
             name_ids = creator.findall("d:nameIdentifier", NS)
             if len(name_ids) > 1:
                 issue_tracker.report(
-                    issue_tracker,
                     path,
                     "WARNING",
                     "MULTIPLE_NAME_IDENTIFIERS",
@@ -531,7 +530,6 @@ def parse_record_file(path: Path, issue_tracker: IssueTracker, strict_unknown: b
             name_ids = contributor.findall("d:nameIdentifier", NS)
             if len(name_ids) > 1:
                 issue_tracker.report(
-                    issue_tracker,
                     path,
                     "WARNING",
                     "MULTIPLE_NAME_IDENTIFIERS",
