@@ -1,38 +1,34 @@
-# Zenodo Dataset Harvester
+# Zenodo dataset metadata: harvest and parsed extract
 
-`zenodo_harvest.py` downloads metadata for published Zenodo records of type `dataset` and saves them to `records.jsonl`.
+This repository contains two related outputs built from Zenodo dataset metadata.
 
-## What it does
+## 1. Raw API harvest
 
-- queries the Zenodo Records API
-- filters for `resource_type.type=dataset`
-- harvests records in a given date range
-- splits large date windows into smaller ones
-- resumes interrupted runs using `state.json`
-- writes one JSON record per line to `records.jsonl`
+The script [`zenodo_harvest.py`](./zenodo_harvest.py) harvests published Zenodo records of type `dataset` from the Zenodo Records API and stores them as JSON Lines.
 
-## Output
+Current raw output:
 
-- `records.jsonl` — harvested records
-- `state.json` — resume state
+- [`zenodo_harvest4/`](./zenodo_harvest4/)
 
-**See [zenodo_harvest4](./zenodo_harvest4/) for the current output.**
+This part of the repository contains:
 
-## Basic usage
+- the harvesting script
+- harvested raw data in `records.jsonl.gz`
 
-```bash
-python zenodo_harvest.py \
-  --out-dir zenodo_dump \
-  --date-from 2014-01-01 \
-  --window-field created
-```
+See [`zenodo_harvest4/README.md`](./zenodo_harvest4/README.md) for details about the harvested file, its coverage, and its basic statistics.
 
-## Notes
+## 2. Selected and parsed XML dump extract
 
-- Without `--append`, the script starts a fresh run: it removes old output files and old resume state.
-- With `--append`, the script continues from the existing output/state instead of starting over.
-- If you provide an API token (`--api-token` or `ZENODO_API_TOKEN`), Zenodo allows larger page sizes than in anonymous mode.
-- `--dedupe-in-memory` keeps a Python `set` of already seen record IDs and skips writing duplicates during the current run.
-- When used together with `--append`, `--dedupe-in-memory` also preloads IDs already present in `records.jsonl`, which helps avoid re-writing records after an interrupted run.
-- `--dedupe-in-memory` is useful for reliability, but it increases RAM usage because all seen IDs are kept in memory.
-- For very large harvests, it is still a good idea to run a final offline deduplication check on `records.jsonl` by record `id`.
+The directory [`zenodo_dump_dataset_extract/`](./zenodo_dump_dataset_extract/) contains a structured extract derived from the Zenodo XML metadata dump.
+
+Workflow:
+
+- start from the Zenodo XML dump
+- select only XML files corresponding to records of type `Dataset`
+- parse the selected XML files into structured tables and packaged outputs
+
+Current structured output:
+
+- [`zenodo_dump_dataset_extract/`](./zenodo_dump_dataset_extract/)
+
+See [`zenodo_dump_dataset_extract/README.md`](./zenodo_dump_dataset_extract/README.md) for provenance, selection method, parsing details, package contents, and output files.
