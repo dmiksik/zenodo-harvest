@@ -1,0 +1,46 @@
+{
+  "processed_files": 733319,
+  "fatal_parse_errors": 0,
+  "elapsed_seconds": 792.502031326294,
+  "files_per_second": 925.3212875338022,
+  "output_dir": "dump_dataset_extract_v4_2",
+  "output_format": "parquet",
+  "batch_size": 10000,
+  "progress_every": 5000,
+  "strict_unknown": false,
+  "issues_jsonl": "dump_dataset_extract_v4_2/issues.jsonl",
+  "generated_utc": "2026-03-24T09:50:41.669280+00:00",
+  "issue_counts_by_severity": {
+    "WARNING": 236052
+  },
+  "issue_counts_by_code": {
+    "MULTIPLE_NAME_IDENTIFIERS": 31263,
+    "UNHANDLED_RESOURCE_CHILD": 204789
+  },
+  "top_issue_signatures": [
+    {
+      "signature": "UNHANDLED_RESOURCE_CHILD: Unhandled resource child element 'language'",
+      "count": 122243
+    },
+    {
+      "signature": "UNHANDLED_RESOURCE_CHILD: Unhandled resource child element 'fundingReferences'",
+      "count": 64520
+    },
+    {
+      "signature": "MULTIPLE_NAME_IDENTIFIERS: Contributor has 2 nameIdentifier elements; only the first is mapped into contributors table",
+      "count": 19045
+    },
+    {
+      "signature": "UNHANDLED_RESOURCE_CHILD: Unhandled resource child element 'geoLocations'",
+      "count": 18026
+    },
+    {
+      "signature": "MULTIPLE_NAME_IDENTIFIERS: Creator has 2 nameIdentifier elements; only the first is mapped into creators table",
+      "count": 12209
+    },
+    {
+      "signature": "MULTIPLE_NAME_IDENTIFIERS: Creator has 3 nameIdentifier elements; only the first is mapped into creators table",
+      "count": 9
+    }
+  ]
+}

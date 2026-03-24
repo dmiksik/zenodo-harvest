@@ -1,7 +1,9 @@
 
-# Zenodo OAI-PMH / DataCite XML → analytical tables (v1)
+# Zenodo OAI-PMH / DataCite XML → analytical tables (v2)
 
 Tento dokument popisuje přesný mapping z XML do tabulek, které generuje `parse_zenodo_oai_datacite.py`.
+
+Ve verzi v2 je navíc mapován element `version` do sloupce `records.version`.
 
 ## Obecná pravidla
 
@@ -47,6 +49,7 @@ Jeden řádek = jeden XML soubor / jeden record.
 | `publication_year` | `/resource/publicationYear` jako integer |
 | `resource_type` | `/resource/resourceType` text |
 | `resource_type_general` | `/resource/resourceType/@resourceTypeGeneral` |
+| `version` | `/resource/version` text |
 | `issued_date_raw` | první `/resource/dates/date[@dateType="Issued"]` text |
 | `issued_date` | `issued_date_raw` převedené na `DATE` pouze pokud je ve formátu `YYYY-MM-DD` |
 | `updated_date_raw` | první `/resource/dates/date[@dateType="Updated"]` text |
@@ -266,7 +269,7 @@ XPath: `/oai_datacite/payload/resource/alternateIdentifiers/alternateIdentifier`
 Parser loguje issues pro:
 
 - neobsloužený přímý child element `oai_datacite`
-- neobsloužený přímý child element `resource`
+- neobsloužený přímý child element `resource` (s výjimkou elementu `version`, který je ve v2 mapován do `records.version`)
 - neobsloužený child element uvnitř `creator`
 - neobsloužený child element uvnitř `contributor`
 - neobsloužený atribut na elementech, které parser zná
@@ -289,10 +292,11 @@ Issues se zapisují do `issues.jsonl` se základní identifikací souboru:
 Parser **zatím vědomě neukládá** některé DataCite bloky, které se mohou v dumpu objevit, např.:
 
 - `language`
-- `version`
 - `sizes`
 - `formats`
 - `fundingReferences`
 - `geoLocations`
 
 Pokud se objeví, parser je **zachytí jako issue** (`UNHANDLED_RESOURCE_CHILD`), takže půjde přesně dohledat, ve kterých souborech se tyto struktury vyskytly.
+
+Element `version` do této skupiny ve v2 už nepatří: mapuje se do `records.version` jako normalizovaný text z `/resource/version`.

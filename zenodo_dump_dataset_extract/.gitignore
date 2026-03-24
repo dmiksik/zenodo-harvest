@@ -1,0 +1,22 @@
+# ignore raw parsed tables
+/alternate_identifiers/
+/contributors/
+/creators/
+/dates/
+/descriptions/
+/records/
+/related_identifiers/
+/rights/
+/subjects/
+/titles/
+
+# ignore raw local database
+/zenodo_extract.duckdb
+/zenodo_extract.duckdb.sha256
+
+# keep packaged deliverables and text reports
+!/README.md
+!/summary.json
+!/issues.jsonl
+!/zenodo_dataset_extract_parquet_2026-03-24.tar.gz
+!/zenodo_dataset_extract_duckdb_2026-03-24.tar.gz
