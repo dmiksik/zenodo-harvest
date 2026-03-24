@@ -11,20 +11,20 @@ Default target format is Parquet (requires pyarrow). JSONL is available as a fal
 
 Notes:
 - The parser is intentionally conservative. Unknown / unhandled XML elements and attributes
-  are logged to issues.jsonl and printed to stderr with the source file.
+  are logged to issues.jsonl and aggregated into summary.json; they are not printed one-by-one.
 - Fatal parse failures do not stop the whole run. A minimal row with parse_ok = False is emitted
   into records.
+- xml_sha256 has been removed to avoid re-reading every XML file and slowing the run down.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
-import os
 import re
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
@@ -120,7 +120,6 @@ PARQUET_SCHEMA = {
         ("alternate_identifier_count", "int64"),
         ("access_rights_uri", "string"),
         ("access_rights_label", "string"),
-        ("xml_sha256", "string"),
         ("parse_ok", "bool"),
         ("parse_error", "string"),
     ],
@@ -271,12 +270,6 @@ def parse_date(value: Optional[str]) -> Optional[dt.date]:
         return None
 
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def issue_dict(path: Path, severity: str, code: str, message: str, record_id: Optional[str] = None, context: Optional[str] = None) -> dict:
@@ -292,25 +285,39 @@ def issue_dict(path: Path, severity: str, code: str, message: str, record_id: Op
     }
 
 
-def report_issue(issues_fp, path: Path, severity: str, code: str, message: str, record_id: Optional[str] = None, context: Optional[str] = None) -> None:
-    payload = issue_dict(path, severity, code, message, record_id=record_id, context=context)
-    issues_fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    issues_fp.flush()
-    prefix = f"[{severity}] {code}: {path}"
-    if record_id:
-        prefix += f" (record_id={record_id})"
-    if context:
-        prefix += f" [{context}]"
-    eprint(f"{prefix} - {message}")
+class IssueTracker:
+    def __init__(self, issue_tracker) -> None:
+        self.issue_tracker = issue_tracker
+        self.counts_by_severity: dict[str, int] = defaultdict(int)
+        self.counts_by_code: dict[str, int] = defaultdict(int)
+        self.counts_by_signature: dict[str, int] = defaultdict(int)
+
+    def report(self, path: Path, severity: str, code: str, message: str, record_id: Optional[str] = None, context: Optional[str] = None) -> None:
+        payload = issue_dict(path, severity, code, message, record_id=record_id, context=context)
+        self.issue_tracker.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self.counts_by_severity[severity] += 1
+        self.counts_by_code[code] += 1
+        self.counts_by_signature[f"{code}: {message}"] += 1
+
+    def build_summary(self, top_n: int = 50) -> dict[str, Any]:
+        top_signatures = sorted(self.counts_by_signature.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
+        return {
+            "issue_counts_by_severity": dict(sorted(self.counts_by_severity.items())),
+            "issue_counts_by_code": dict(sorted(self.counts_by_code.items())),
+            "top_issue_signatures": [
+                {"signature": sig, "count": count}
+                for sig, count in top_signatures
+            ],
+        }
 
 
-def check_unknown_attributes(el: etree._Element, path: Path, issues_fp, record_id: Optional[str], context: str, strict_unknown: bool) -> None:
+def check_unknown_attributes(el: etree._Element, path: Path, issue_tracker: IssueTracker, record_id: Optional[str], context: str, strict_unknown: bool) -> None:
     local = etree.QName(el).localname
     allowed = ALLOWED_ATTRS.get(local, set())
     for k in el.attrib:
         if k not in allowed:
             message = f"Unhandled attribute {attr_name(k)!r} on element {local!r}"
-            report_issue(issues_fp, path, "WARNING", "UNHANDLED_ATTRIBUTE", message, record_id=record_id, context=context)
+            issue_tracker.report(path, "WARNING", "UNHANDLED_ATTRIBUTE", message, record_id=record_id, context=context)
             if strict_unknown:
                 raise ValueError(message)
 
@@ -334,11 +341,48 @@ def make_empty_rows() -> dict[str, list[dict]]:
     return {table: [] for table in TABLES}
 
 
-def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> dict[str, list[dict]]:
-    rows = make_empty_rows()
-    xml_hash = sha256_file(path)
 
+
+def build_error_record(path: Path, error_message: str) -> dict[str, Any]:
+    return {
+        "record_id": extract_record_id(None, None, path.name),
+        "source_xml_path": str(path),
+        "source_file_name": path.name,
+        "schema_version": None,
+        "datacentre_symbol": None,
+        "identifier": None,
+        "identifier_type": None,
+        "oai_identifier": None,
+        "record_url": None,
+        "publisher": None,
+        "publication_year": None,
+        "resource_type": None,
+        "resource_type_general": None,
+        "issued_date_raw": None,
+        "issued_date": None,
+        "updated_date_raw": None,
+        "updated_date": None,
+        "primary_title": None,
+        "title_count": 0,
+        "description_count": 0,
+        "creator_count": 0,
+        "contributor_count": 0,
+        "subject_count": 0,
+        "related_identifier_count": 0,
+        "rights_count": 0,
+        "alternate_identifier_count": 0,
+        "access_rights_uri": None,
+        "access_rights_label": None,
+        "parse_ok": False,
+        "parse_error": error_message,
+    }
+
+def parse_record_file(path: Path, issue_tracker: IssueTracker, strict_unknown: bool = False) -> dict[str, list[dict]]:
+    rows = make_empty_rows()
     try:
+        if not path.exists():
+            raise FileNotFoundError(f"No such file or directory: {path}")
+
         tree = etree.parse(str(path))
         root = tree.getroot()
 
@@ -347,7 +391,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
             local = etree.QName(child).localname
             if local not in HANDLED_ROOT_CHILDREN:
                 message = f"Unhandled root child element {local!r}"
-                report_issue(issues_fp, path, "WARNING", "UNHANDLED_ROOT_CHILD", message, context="/oai_datacite")
+                issue_tracker.report(path, "WARNING", "UNHANDLED_ROOT_CHILD", message, context="/oai_datacite")
                 if strict_unknown:
                     raise ValueError(message)
 
@@ -362,12 +406,12 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
             local = etree.QName(child).localname
             if local not in HANDLED_RESOURCE_CHILDREN:
                 message = f"Unhandled resource child element {local!r}"
-                report_issue(issues_fp, path, "WARNING", "UNHANDLED_RESOURCE_CHILD", message, context="/oai_datacite/payload/resource")
+                issue_tracker.report(path, "WARNING", "UNHANDLED_RESOURCE_CHILD", message, context="/oai_datacite/payload/resource")
                 if strict_unknown:
                     raise ValueError(message)
 
         identifier_el = resource.find("d:identifier", NS)
-        check_unknown_attributes(identifier_el, path, issues_fp, None, "/resource/identifier", strict_unknown) if identifier_el is not None else None
+        check_unknown_attributes(identifier_el, path, issue_tracker, None, "/resource/identifier", strict_unknown) if identifier_el is not None else None
         identifier = element_text(identifier_el)
         identifier_type = identifier_el.get("identifierType") if identifier_el is not None else None
 
@@ -375,7 +419,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
         record_url = None
         oai_identifier = None
         for idx, alt in enumerate(resource.findall("d:alternateIdentifiers/d:alternateIdentifier", NS), start=1):
-            check_unknown_attributes(alt, path, issues_fp, None, f"/resource/alternateIdentifiers/alternateIdentifier[{idx}]", strict_unknown)
+            check_unknown_attributes(alt, path, issue_tracker, None, f"/resource/alternateIdentifiers/alternateIdentifier[{idx}]", strict_unknown)
             alt_value = element_text(alt)
             alt_type = alt.get("alternateIdentifierType")
             alt_rows.append({
@@ -393,7 +437,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
 
         titles = []
         for idx, title_el in enumerate(resource.findall("d:titles/d:title", NS), start=1):
-            check_unknown_attributes(title_el, path, issues_fp, record_id, f"/resource/titles/title[{idx}]", strict_unknown)
+            check_unknown_attributes(title_el, path, issue_tracker, record_id, f"/resource/titles/title[{idx}]", strict_unknown)
             titles.append({
                 "record_id": record_id,
                 "source_xml_path": str(path),
@@ -410,13 +454,13 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
                 local = etree.QName(child).localname
                 if local not in HANDLED_CREATOR_CHILDREN:
                     message = f"Unhandled creator child element {local!r}"
-                    report_issue(issues_fp, path, "WARNING", "UNHANDLED_CREATOR_CHILD", message, record_id=record_id, context=f"/resource/creators/creator[{creator_idx}]")
+                    issue_tracker.report(path, "WARNING", "UNHANDLED_CREATOR_CHILD", message, record_id=record_id, context=f"/resource/creators/creator[{creator_idx}]")
                     if strict_unknown:
                         raise ValueError(message)
 
             creator_name_el = creator.find("d:creatorName", NS)
             if creator_name_el is not None:
-                check_unknown_attributes(creator_name_el, path, issues_fp, record_id, f"/resource/creators/creator[{creator_idx}]/creatorName", strict_unknown)
+                check_unknown_attributes(creator_name_el, path, issue_tracker, record_id, f"/resource/creators/creator[{creator_idx}]/creatorName", strict_unknown)
             given_name = element_text(creator.find("d:givenName", NS))
             family_name = element_text(creator.find("d:familyName", NS))
             creator_name = element_text(creator_name_el)
@@ -424,8 +468,8 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
 
             name_ids = creator.findall("d:nameIdentifier", NS)
             if len(name_ids) > 1:
-                report_issue(
-                    issues_fp,
+                issue_tracker.report(
+                    issue_tracker,
                     path,
                     "WARNING",
                     "MULTIPLE_NAME_IDENTIFIERS",
@@ -437,7 +481,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
                     raise ValueError("Multiple creator nameIdentifier elements")
             name_id = name_ids[0] if name_ids else None
             if name_id is not None:
-                check_unknown_attributes(name_id, path, issues_fp, record_id, f"/resource/creators/creator[{creator_idx}]/nameIdentifier[1]", strict_unknown)
+                check_unknown_attributes(name_id, path, issue_tracker, record_id, f"/resource/creators/creator[{creator_idx}]/nameIdentifier[1]", strict_unknown)
 
             affiliations = creator.findall("d:affiliation", NS)
             if not affiliations:
@@ -445,7 +489,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
 
             for aff_idx, aff in enumerate(affiliations, start=1):
                 if aff is not None:
-                    check_unknown_attributes(aff, path, issues_fp, record_id, f"/resource/creators/creator[{creator_idx}]/affiliation[{aff_idx}]", strict_unknown)
+                    check_unknown_attributes(aff, path, issue_tracker, record_id, f"/resource/creators/creator[{creator_idx}]/affiliation[{aff_idx}]", strict_unknown)
                 creators.append({
                     "record_id": record_id,
                     "source_xml_path": str(path),
@@ -467,18 +511,18 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
         contributors = []
         contributor_nodes = resource.findall("d:contributors/d:contributor", NS)
         for c_idx, contributor in enumerate(contributor_nodes, start=1):
-            check_unknown_attributes(contributor, path, issues_fp, record_id, f"/resource/contributors/contributor[{c_idx}]", strict_unknown)
+            check_unknown_attributes(contributor, path, issue_tracker, record_id, f"/resource/contributors/contributor[{c_idx}]", strict_unknown)
             for child in contributor:
                 local = etree.QName(child).localname
                 if local not in HANDLED_CONTRIBUTOR_CHILDREN:
                     message = f"Unhandled contributor child element {local!r}"
-                    report_issue(issues_fp, path, "WARNING", "UNHANDLED_CONTRIBUTOR_CHILD", message, record_id=record_id, context=f"/resource/contributors/contributor[{c_idx}]")
+                    issue_tracker.report(path, "WARNING", "UNHANDLED_CONTRIBUTOR_CHILD", message, record_id=record_id, context=f"/resource/contributors/contributor[{c_idx}]")
                     if strict_unknown:
                         raise ValueError(message)
 
             name_el = contributor.find("d:contributorName", NS)
             if name_el is not None:
-                check_unknown_attributes(name_el, path, issues_fp, record_id, f"/resource/contributors/contributor[{c_idx}]/contributorName", strict_unknown)
+                check_unknown_attributes(name_el, path, issue_tracker, record_id, f"/resource/contributors/contributor[{c_idx}]/contributorName", strict_unknown)
             given_name = element_text(contributor.find("d:givenName", NS))
             family_name = element_text(contributor.find("d:familyName", NS))
             contributor_name = element_text(name_el)
@@ -486,8 +530,8 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
 
             name_ids = contributor.findall("d:nameIdentifier", NS)
             if len(name_ids) > 1:
-                report_issue(
-                    issues_fp,
+                issue_tracker.report(
+                    issue_tracker,
                     path,
                     "WARNING",
                     "MULTIPLE_NAME_IDENTIFIERS",
@@ -499,7 +543,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
                     raise ValueError("Multiple contributor nameIdentifier elements")
             name_id = name_ids[0] if name_ids else None
             if name_id is not None:
-                check_unknown_attributes(name_id, path, issues_fp, record_id, f"/resource/contributors/contributor[{c_idx}]/nameIdentifier[1]", strict_unknown)
+                check_unknown_attributes(name_id, path, issue_tracker, record_id, f"/resource/contributors/contributor[{c_idx}]/nameIdentifier[1]", strict_unknown)
 
             affiliations = contributor.findall("d:affiliation", NS)
             if not affiliations:
@@ -507,7 +551,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
 
             for aff_idx, aff in enumerate(affiliations, start=1):
                 if aff is not None:
-                    check_unknown_attributes(aff, path, issues_fp, record_id, f"/resource/contributors/contributor[{c_idx}]/affiliation[{aff_idx}]", strict_unknown)
+                    check_unknown_attributes(aff, path, issue_tracker, record_id, f"/resource/contributors/contributor[{c_idx}]/affiliation[{aff_idx}]", strict_unknown)
                 contributors.append({
                     "record_id": record_id,
                     "source_xml_path": str(path),
@@ -529,7 +573,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
 
         subjects = []
         for idx, subject in enumerate(resource.findall("d:subjects/d:subject", NS), start=1):
-            check_unknown_attributes(subject, path, issues_fp, record_id, f"/resource/subjects/subject[{idx}]", strict_unknown)
+            check_unknown_attributes(subject, path, issue_tracker, record_id, f"/resource/subjects/subject[{idx}]", strict_unknown)
             subjects.append({
                 "record_id": record_id,
                 "source_xml_path": str(path),
@@ -548,7 +592,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
         issued_date = None
         updated_date = None
         for idx, date_el in enumerate(resource.findall("d:dates/d:date", NS), start=1):
-            check_unknown_attributes(date_el, path, issues_fp, record_id, f"/resource/dates/date[{idx}]", strict_unknown)
+            check_unknown_attributes(date_el, path, issue_tracker, record_id, f"/resource/dates/date[{idx}]", strict_unknown)
             date_type = date_el.get("dateType")
             date_raw = element_text(date_el)
             date_value = parse_date(date_raw)
@@ -569,13 +613,13 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
                 updated_date = date_value
 
         resource_type_el = resource.find("d:resourceType", NS)
-        check_unknown_attributes(resource_type_el, path, issues_fp, record_id, "/resource/resourceType", strict_unknown) if resource_type_el is not None else None
+        check_unknown_attributes(resource_type_el, path, issue_tracker, record_id, "/resource/resourceType", strict_unknown) if resource_type_el is not None else None
         resource_type = element_text(resource_type_el)
         resource_type_general = resource_type_el.get("resourceTypeGeneral") if resource_type_el is not None else None
 
         related_identifiers = []
         for idx, rel in enumerate(resource.findall("d:relatedIdentifiers/d:relatedIdentifier", NS), start=1):
-            check_unknown_attributes(rel, path, issues_fp, record_id, f"/resource/relatedIdentifiers/relatedIdentifier[{idx}]", strict_unknown)
+            check_unknown_attributes(rel, path, issue_tracker, record_id, f"/resource/relatedIdentifiers/relatedIdentifier[{idx}]", strict_unknown)
             related_identifiers.append({
                 "record_id": record_id,
                 "source_xml_path": str(path),
@@ -593,7 +637,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
         access_rights_uri = None
         access_rights_label = None
         for idx, rights in enumerate(resource.findall("d:rightsList/d:rights", NS), start=1):
-            check_unknown_attributes(rights, path, issues_fp, record_id, f"/resource/rightsList/rights[{idx}]", strict_unknown)
+            check_unknown_attributes(rights, path, issue_tracker, record_id, f"/resource/rightsList/rights[{idx}]", strict_unknown)
             rights_uri = rights.get("rightsURI")
             if access_rights_uri is None and rights_uri and rights_uri.startswith("info:eu-repo/semantics/"):
                 access_rights_uri = rights_uri
@@ -612,7 +656,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
 
         descriptions = []
         for idx, desc in enumerate(resource.findall("d:descriptions/d:description", NS), start=1):
-            check_unknown_attributes(desc, path, issues_fp, record_id, f"/resource/descriptions/description[{idx}]", strict_unknown)
+            check_unknown_attributes(desc, path, issue_tracker, record_id, f"/resource/descriptions/description[{idx}]", strict_unknown)
             descriptions.append({
                 "record_id": record_id,
                 "source_xml_path": str(path),
@@ -652,8 +696,7 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
             "alternate_identifier_count": len(alt_rows),
             "access_rights_uri": access_rights_uri,
             "access_rights_label": access_rights_label,
-            "xml_sha256": xml_hash,
-            "parse_ok": True,
+                "parse_ok": True,
             "parse_error": None,
         }
 
@@ -674,40 +717,9 @@ def parse_record_file(path: Path, issues_fp, strict_unknown: bool = False) -> di
         return rows
 
     except Exception as exc:
-        report_issue(issues_fp, path, "ERROR", "PARSE_EXCEPTION", str(exc), record_id=None, context="parse_record_file")
-        rows["records"].append({
-            "record_id": extract_record_id(None, None, path.name),
-            "source_xml_path": str(path),
-            "source_file_name": path.name,
-            "schema_version": None,
-            "datacentre_symbol": None,
-            "identifier": None,
-            "identifier_type": None,
-            "oai_identifier": None,
-            "record_url": None,
-            "publisher": None,
-            "publication_year": None,
-            "resource_type": None,
-            "resource_type_general": None,
-            "issued_date_raw": None,
-            "issued_date": None,
-            "updated_date_raw": None,
-            "updated_date": None,
-            "primary_title": None,
-            "title_count": 0,
-            "description_count": 0,
-            "creator_count": 0,
-            "contributor_count": 0,
-            "subject_count": 0,
-            "related_identifier_count": 0,
-            "rights_count": 0,
-            "alternate_identifier_count": 0,
-            "access_rights_uri": None,
-            "access_rights_label": None,
-            "xml_sha256": xml_hash,
-            "parse_ok": False,
-            "parse_error": str(exc),
-        })
+        issue_code = "MISSING_INPUT_FILE" if isinstance(exc, FileNotFoundError) else "PARSE_EXCEPTION"
+        issue_tracker.report(path, "ERROR", issue_code, str(exc), record_id=None, context="parse_record_file")
+        rows["records"].append(build_error_record(path, str(exc)))
         return rows
 
 
@@ -832,11 +844,15 @@ def main() -> None:
 
     processed = 0
     fatal_errors = 0
+    started = time.time()
 
-    with issues_path.open("a", encoding="utf-8") as issues_fp:
+    eprint(f"[INFO] Starting. output={args.output_dir} format={args.output_format}")
+
+    with issues_path.open("w", encoding="utf-8") as issues_fp:
+        issue_tracker = IssueTracker(issues_fp)
         for xml_path in iter_input_files(args.input_list, args.input_dir):
             processed += 1
-            rows = parse_record_file(xml_path, issues_fp, strict_unknown=args.strict_unknown)
+            rows = parse_record_file(xml_path, issue_tracker, strict_unknown=args.strict_unknown)
             if rows["records"] and rows["records"][0].get("parse_ok") is False:
                 fatal_errors += 1
             merge_rows(buffers, rows)
@@ -846,26 +862,33 @@ def main() -> None:
                 buffers = empty_buffers()
 
             if processed % args.progress_every == 0:
+                elapsed = max(time.time() - started, 0.001)
+                rate = processed / elapsed
                 if total:
-                    eprint(f"[INFO] Processed {processed}/{total} files ({processed / total:.1%})")
+                    eprint(f"[INFO] {processed}/{total} ({processed / total:.1%}), rate={rate:.1f} files/s, fatal={fatal_errors}")
                 else:
-                    eprint(f"[INFO] Processed {processed} files")
+                    eprint(f"[INFO] {processed} files, rate={rate:.1f} files/s, fatal={fatal_errors}")
 
         writer.flush_all(buffers)
 
+    elapsed = time.time() - started
     summary = {
         "processed_files": processed,
         "fatal_parse_errors": fatal_errors,
+        "elapsed_seconds": elapsed,
+        "files_per_second": (processed / elapsed) if elapsed > 0 else None,
         "output_dir": str(args.output_dir),
         "output_format": args.output_format,
         "batch_size": args.batch_size,
+        "progress_every": args.progress_every,
         "strict_unknown": args.strict_unknown,
         "issues_jsonl": str(issues_path),
         "generated_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        **issue_tracker.build_summary(),
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    eprint(f"[INFO] Done. processed={processed}, fatal_parse_errors={fatal_errors}, output={args.output_dir}")
+    eprint(f"[INFO] Done. processed={processed}, fatal_parse_errors={fatal_errors}, elapsed={elapsed:.1f}s, rate={(processed / elapsed) if elapsed > 0 else 0:.1f} files/s, output={args.output_dir}")
 
 
 if __name__ == "__main__":
