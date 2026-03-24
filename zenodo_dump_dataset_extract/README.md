@@ -2,6 +2,48 @@
 
 Parsed metadata extract of published Zenodo dataset records, produced from Zenodo OAI-PMH / DataCite XML.
 
+## Provenance
+
+### 1. Source dump
+
+The starting point was the latest available Zenodo bulk XML metadata dump at the time of processing:
+
+- dump type: `records-xml.tar.gz`
+- dump creation time: `2026-02-07T00:07:24.920272+00:00`
+- exact dump URL: `https://zenodo.org/api/exporter/records-xml.tar.gz/72eafab9-4090-448b-9163-39fcd7e28715`
+
+Zenodo metadata dumps are published via the `/api/exporter` endpoint. The XML dump archive contains one XML file per record, named `<record_id>.xml`.
+
+### 2. Selection of dataset records
+
+From the unpacked XML dump, we selected only those XML files that contained the exact string:
+
+```text
+<resourceType resourceTypeGeneral="Dataset">
+```
+
+The initial filename extraction command was:
+
+```bash
+PATTERN='<resourceType resourceTypeGeneral="Dataset">'
+
+LC_ALL=C find zenodo-records -type f -name '*.xml' -print0   | xargs -0 -r grep -lZF -- "$PATTERN"   | xargs -0 -n1 basename   > dataset-filenames.txt
+```
+
+This produced a plain-text list of XML filenames corresponding to records of type `Dataset`.
+
+### 3. File list used for parsing
+
+The list of selected XML filenames is included in this directory as:
+
+- [`dataset-filenames.txt`](./dataset-filenames.txt)
+
+Only XML files listed there were passed to the parser.
+
+### 4. Parsing
+
+The selected XML files were then parsed into the structured extract described below.
+
 ## What this package contains
 
 This package contains a structured analytical extract split into multiple tables.
@@ -140,9 +182,6 @@ WHERE version IS NOT NULL
 LIMIT 20;
 ```
 
-## Provenance
+## Provenance note
 
-Source: Zenodo OAI-PMH / DataCite XML dataset records.
-
-This package is a parsed analytical extract, not the original raw XML dump.
-
+This package is a parsed analytical extract derived from the Zenodo XML metadata dump, not the original raw dump itself.
