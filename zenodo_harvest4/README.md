@@ -1,15 +1,3 @@
-## Data in `zenodo_harvest4`
-
-This directory contains the current raw harvest output produced by:
-
-```bash
-python zenodo_harvest.py \
-  --out-dir zenodo_harvest4 \
-  --date-from 2016-01-01 \
-  --window-field created \
-  --dedupe-in-memory
-```
-
 ## What is in `records.jsonl.gz`
 
 `records.jsonl.gz` is a gzip-compressed JSON Lines file harvested from the Zenodo Records API.
@@ -47,3 +35,24 @@ Typical `metadata` keys:
 `access_right`, `creators`, `description`, `doi`, `journal`, `license`, `publication_date`, `relations`, `resource_type`, `title`.
 
 For parsed / structured output derived from Zenodo OAI-PMH / DataCite XML, see [`../zenodo_dump_dataset_extract/`](../zenodo_dump_dataset_extract/).
+
+## Data in `zenodo_harvest4`
+
+The harvested file in `records.jsonl.gz` was produced by running:
+
+```bash
+python zenodo_harvest.py \
+  --out-dir zenodo_harvest4 \
+  --date-from 2016-01-01 \
+  --window-field created \
+  --dedupe-in-memory
+```
+
+## Notes on harveter usage
+
+- Without `--append`, the script starts a fresh run: it removes old output files and old resume state.
+- With `--append`, the script continues from the existing output/state instead of starting over.
+- If you provide an API token (`--api-token` or `ZENODO_API_TOKEN`), Zenodo allows larger page sizes than in anonymous mode.
+- `--dedupe-in-memory` keeps a Python `set` of already seen record IDs and skips writing duplicates during the current run.
+- When used together with `--append`, `--dedupe-in-memory` also preloads IDs already present in `records.jsonl`, which helps avoid re-writing records after an interrupted run.
+- `--dedupe-in-memory` increases RAM usage because all seen IDs are kept in memory.
